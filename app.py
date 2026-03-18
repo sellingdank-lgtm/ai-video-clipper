@@ -2,18 +2,18 @@ import re
 import shutil
 import subprocess
 from pathlib import Path
+
 import librosa
 import numpy as np
 import streamlit as st
-import yt_dlp
 from scenedetect import SceneManager, open_video
 from scenedetect.detectors import ContentDetector
 
 st.set_page_config(page_title="AI Video Clipper Pro", layout="wide")
 
-# === CHECK FFMPEG ===
+# Safety check for ffmpeg
 if shutil.which("ffmpeg") is None:
-    st.error("ffmpeg not found on server.")
+    st.error("ffmpeg not found on server. Try again or contact dev.")
     st.stop()
 
 BASE_DIR = Path(__file__).parent
@@ -25,9 +25,14 @@ for folder in [DOWNLOADS_DIR, CLIPS_DIR, TEMP_DIR]:
     folder.mkdir(exist_ok=True)
 
 st.title("AI Video Clipper Pro")
-st.write("Paste a YouTube link and generate smart clips.")
+st.write("Upload a video (mp4 or mov) and generate smart clips. Max ~200MB recommended on free tier.")
 
-url = st.text_input("YouTube Link")
+uploaded_file = st.file_uploader(
+    "Choose video file",
+    type=["mp4", "mov"],
+    help="Short videos work best (under 5 min) on free tier."
+)
+
 max_clips = st.slider("How many clips?", 1, 10, 5)
 vertical_mode = st.checkbox("Make 9:16 Shorts", value=True)
 
@@ -55,30 +60,12 @@ def run_cmd(cmd):
 
 def get_video_duration(video_path: str) -> float:
     return float(run_cmd([
-        "ffprobe", "-v", "error",
+        "ffprobe",
+        "-v", "error",
         "-show_entries", "format=duration",
         "-of", "default=noprint_wrappers=1:nokey=1",
         video_path
     ]))
-
-def download_video(youtube_url: str):
-    clear_folder(DOWNLOADS_DIR)
-
-    ydl_opts = {
-        "format": "bv*+ba/best",
-        "merge_output_format": "mp4",
-        "outtmpl": str(DOWNLOADS_DIR / "%(title)s.%(ext)s"),
-        "noplaylist": True,
-    }
-
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(youtube_url, download=True)
-        title = safe_name(info.get("title", "video"))
-
-    mp4s = sorted(DOWNLOADS_DIR.glob("*.mp4"), key=lambda p: p.stat().st_mtime, reverse=True)
-    if not mp4s:
-        raise FileNotFoundError("Video download failed.")
-    return str(mp4s[0]), title
 
 def detect_scenes(video_path: str):
     try:
@@ -90,14 +77,17 @@ def detect_scenes(video_path: str):
 
         scenes = []
         for scene in scene_list:
-            scenes.append((scene[0].get_seconds(), scene[1].get_seconds()))
+            start_sec = scene[0].get_seconds()
+            end_sec = scene[1].get_seconds()
+            scenes.append((start_sec, end_sec))
         return scenes
-    except:
+    except Exception:
         return []
 
 def extract_audio_wav(video_path: str, wav_path: str):
     run_cmd([
-        "ffmpeg", "-y",
+        "ffmpeg",
+        "-y",
         "-i", video_path,
         "-vn",
         "-ac", "1",
@@ -105,93 +95,194 @@ def extract_audio_wav(video_path: str, wav_path: str):
         wav_path
     ])
 
-def get_audio_peaks(wav_path: str):
+def get_audio_peaks(wav_path: str, hop_length: int = 512):
     try:
         y, sr = librosa.load(wav_path, sr=16000, mono=True)
-        rms = librosa.feature.rms(y=y)[0]
-        times = librosa.frames_to_time(range(len(rms)), sr=sr)
+        rms = librosa.feature.rms(y=y, hop_length=hop_length)[0]
+        times = librosa.frames_to_time(np.arange(len(rms)), sr=sr, hop_length=hop_length)
 
-        threshold = np.mean(rms) + np.std(rms) * 1.25
+        mean_rms = float(np.mean(rms))
+        std_rms = float(np.std(rms))
+        threshold = mean_rms + std_rms * 1.25
 
         peaks = []
         for t, val in zip(times, rms):
             if val > threshold:
                 peaks.append((float(t), float(val)))
+
         return peaks
-    except:
+    except Exception:
         return []
 
-def audio_score(start, end, peaks):
-    vals = [v for t, v in peaks if start <= t <= end]
-    return min(5, int(sum(vals) * 50)) if vals else 0
+def audio_score_for_range(start: float, end: float, peaks):
+    vals = [peak_val for peak_time, peak_val in peaks if start <= peak_time <= end]
+    if not vals:
+        return 0
+    return min(5, int(round(sum(vals) / len(vals) * 50)))
 
-def build_candidates(scenes, peaks, duration):
-    if not scenes:
-        return [{"start": i, "end": i+20, "score": 1} for i in range(0, int(duration), 20)]
-
+def build_candidates_from_scenes(scenes, peaks, video_duration):
     candidates = []
-    for s, e in scenes:
-        start = max(0, s-1)
-        end = min(duration, e+2)
 
-        score = audio_score(start, end, peaks)
-        candidates.append({"start": start, "end": end, "score": score})
+    if not scenes:
+        step = 20
+        t = 0
+        while t < min(video_duration, step * 12):
+            candidates.append({
+                "start": float(t),
+                "end": float(min(video_duration, t + 20)),
+                "score": 1.0,
+                "text": "Auto clip"
+            })
+            t += step
+        return candidates
+
+    for s_start, s_end in scenes:
+        clip_start = max(0, s_start - 1)
+        clip_end = min(video_duration, s_end + 2)
+
+        if clip_end - clip_start < 8:
+            clip_end = min(video_duration, clip_start + 12)
+        if clip_end - clip_start > 35:
+            clip_end = clip_start + 35
+
+        aud_score = audio_score_for_range(clip_start, clip_end, peaks)
+        scene_len_score = 2 if 8 <= (clip_end - clip_start) <= 30 else 1
+        final_score = aud_score * 0.6 + scene_len_score * 0.4
+
+        candidates.append({
+            "start": round(clip_start, 2),
+            "end": round(clip_end, 2),
+            "score": round(final_score, 2),
+            "text": "Scene-based clip"
+        })
+
     return candidates
 
-def pick_best(candidates, max_count):
-    return sorted(candidates, key=lambda x: x["score"], reverse=True)[:max_count]
+def overlaps(a_start, a_end, b_start, b_end):
+    return not (a_end <= b_start or a_start >= b_end)
 
-def cut_clip(video_path, start, end, output_path, vertical):
-    vf = []
+def pick_best_candidates(candidates, max_count=5):
+    ranked = sorted(candidates, key=lambda x: x["score"], reverse=True)
+    chosen = []
+
+    for c in ranked:
+        if any(overlaps(c["start"], c["end"], x["start"], x["end"]) for x in chosen):
+            continue
+        chosen.append(c)
+        if len(chosen) >= max_count:
+            break
+
+    return sorted(chosen, key=lambda x: x["start"])
+
+def cut_clip(video_path: str, start: float, end: float, output_path: str, vertical=False):
+    vf_parts = []
+
     if vertical:
-        vf.append("scale=1080:1920:force_original_aspect_ratio=decrease")
-        vf.append("pad=1080:1920:(ow-iw)/2:(oh-ih)/2")
+        vf_parts.append("scale=1080:1920:force_original_aspect_ratio=decrease")
+        vf_parts.append("pad=1080:1920:(ow-iw)/2:(oh-ih)/2")
 
     cmd = [
-        "ffmpeg", "-y",
+        "ffmpeg",
+        "-y",
         "-ss", str(start),
         "-to", str(end),
-        "-i", video_path
+        "-i", video_path,
     ]
 
-    if vf:
-        cmd += ["-vf", ",".join(vf)]
+    if vf_parts:
+        cmd += ["-vf", ",".join(vf_parts)]
 
-    cmd += ["-c:v", "libx264", "-c:a", "aac", output_path]
+    cmd += [
+        "-c:v", "libx264",
+        "-c:a", "aac",
+        output_path
+    ]
 
     run_cmd(cmd)
 
+def process_uploaded_video(uploaded_file):
+    if uploaded_file is None:
+        return None, None
+
+    clear_folder(DOWNLOADS_DIR)
+
+    clean_name = safe_name(uploaded_file.name)
+    video_path = str(DOWNLOADS_DIR / clean_name)
+
+    with open(video_path, "wb") as f:
+        f.write(uploaded_file.getbuffer())
+
+    title = safe_name(uploaded_file.name.rsplit(".", 1)[0])
+    return video_path, title
+
 if st.button("Generate Clips"):
+    if uploaded_file is None:
+        st.error("Upload a video file first.")
+        st.stop()
+
+    if uploaded_file.size > 200 * 1024 * 1024:
+        st.error("File too large (>200MB). Free tier may crash or timeout.")
+        st.stop()
+
+    status = st.empty()
     try:
         clear_folder(CLIPS_DIR)
         clear_folder(TEMP_DIR)
 
-        st.info("Downloading...")
-        video_path, title = download_video(url)
+        status.info("Processing uploaded video...")
+        video_path, title = process_uploaded_video(uploaded_file)
 
-        st.info("Scenes...")
+        status.info("Detecting scenes...")
         scenes = detect_scenes(video_path)
 
-        st.info("Audio...")
-        wav = str(TEMP_DIR / "audio.wav")
-        extract_audio_wav(video_path, wav)
-        peaks = get_audio_peaks(wav)
+        status.info("Analyzing audio spikes...")
+        wav_path = str(TEMP_DIR / "audio.wav")
+        extract_audio_wav(video_path, wav_path)
+        peaks = get_audio_peaks(wav_path)
 
-        duration = get_video_duration(video_path)
-        candidates = build_candidates(scenes, peaks, duration)
-        best = pick_best(candidates, max_clips)
+        status.info("Scoring best moments...")
+        video_duration = get_video_duration(video_path)
+        candidates = build_candidates_from_scenes(scenes, peaks, video_duration)
+        best = pick_best_candidates(candidates, max_count=max_clips)
 
-        st.info("Cutting clips...")
-        clips = []
-        for i, c in enumerate(best, 1):
-            out = CLIPS_DIR / f"{i}_{title}.mp4"
-            cut_clip(video_path, c["start"], c["end"], str(out), vertical_mode)
-            clips.append(out)
+        if not best:
+            st.error("No clips found.")
+            st.stop()
 
-        st.success("Done")
+        report_rows = []
+        clip_paths = []
 
-        for c in clips:
-            st.video(str(c))
+        status.info("Creating clips...")
+        for i, clip in enumerate(best, start=1):
+            out_path = CLIPS_DIR / f"{i:02d}_{safe_name(title)}.mp4"
+
+            cut_clip(
+                video_path=video_path,
+                start=clip["start"],
+                end=clip["end"],
+                output_path=str(out_path),
+                vertical=vertical_mode
+            )
+
+            report_rows.append({
+                "Clip": i,
+                "Start": clip["start"],
+                "End": clip["end"],
+                "Score": clip["score"],
+            })
+            clip_paths.append(out_path)
+
+        status.success("Done. Clips created.")
+
+        st.subheader("Generated Clips")
+        for row, path in zip(report_rows, clip_paths):
+            st.markdown(f"**Clip {row['Clip']}**")
+            st.caption(f"{row['Start']}s → {row['End']}s | Score: {row['Score']}")
+            st.video(str(path))
+
+        st.subheader("Clip Report")
+        st.json(report_rows)
 
     except Exception as e:
-        st.error(str(e))
+        status.empty()
+        st.error(f"Error: {e}")
