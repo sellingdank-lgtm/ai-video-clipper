@@ -1,5 +1,4 @@
 streamlit
-yt-dlp
 librosa
 numpy
 scenedetect[opencv]
